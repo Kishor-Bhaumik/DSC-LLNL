@@ -1,13 +1,11 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torchvision.models as models
 import numpy as np
 import wandb
-from typing import Optional, Dict, Tuple
+from dataloader import create_split_dataloaders  # Assuming this is your custom dataloader module
 import matplotlib.pyplot as plt
 from sklearn.metrics import jaccard_score, f1_score
 
@@ -41,7 +39,7 @@ class Upscale(nn.Module):
         return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode, align_corners=self.align_corners)
 
 class Unet_Image(nn.Module):
-    def __init__(self, in_channels = 4, mask_content_preds = False):
+    def __init__(self, in_channels=4, mask_content_preds=False):
         super().__init__()
 
         self.mpool_2 = nn.MaxPool2d((2, 2))
@@ -57,14 +55,12 @@ class Unet_Image(nn.Module):
         self.up2 = conv2d_inplace_spatial(256, 64, self.upscale_2)
         self.up3 = conv2d_inplace_spatial(128, 32, self.upscale_2)
         
-        self.up4_amodal_mask = conv2d_inplace_spatial(64, 1, self.upscale_2, activation = nn.Identity())
-        self.up4_amodal_content = conv2d_inplace_spatial(64, 3, self.upscale_2, activation = nn.Identity())
-
+        self.up4_amodal_mask = conv2d_inplace_spatial(64, 1, self.upscale_2, activation=nn.Identity())
+        
         # Optional arguments
-        self.mask_content_preds = mask_content_preds # Should we mask the amodal content prediction by the amodal mask prediction?
+        self.mask_content_preds = mask_content_preds
 
-        # Optimization
-        self.mse_loss = nn.L1Loss()
+        # Loss functions
         self.bce_loss = nn.BCEWithLogitsLoss()
         
     def encode(self, x):
@@ -75,33 +71,18 @@ class Unet_Image(nn.Module):
         return x1, x2, x3, x4
     
     def decode(self, h1, h2, h3, h4):
-        h4 = self.up1(h4) # 6, 256, 1, 16, 16 -> 6, 128, 1, 32, 32 (double spatial, then conv-in-place channels to half)
-        h34 = torch.cat((h3, h4), dim = 1) # (6, 2*128, 1, 32, 32)
+        h4 = self.up1(h4)  # Upsample and reduce channels
+        h34 = torch.cat((h3, h4), dim=1)  # Skip connection
 
-        h34 = self.up2(h34) # 6, 256, 1, 32, 32 -> 6, 128, 2, 64, 64
-        h234 = torch.cat((h2, h34), dim = 1)
+        h34 = self.up2(h34)
+        h234 = torch.cat((h2, h34), dim=1)  # Skip connection
 
         h234 = self.up3(h234)
-        h1234 = torch.cat((h1, h234), dim = 1)
+        h1234 = torch.cat((h1, h234), dim=1)  # Skip connection
         
         logits_amodal_mask = self.up4_amodal_mask(h1234)
-        logits_amodal_content = self.up4_amodal_content(h1234)
-        return logits_amodal_mask, logits_amodal_content
+        return logits_amodal_mask
     
-    def encode_decode(self, x):
-        """
-        input image tensor: (bs, c, h, w)
-        """
-        b, c, h, w = x.shape
-
-        # Multiscale features x1, x2, x3, x4
-        x1, x2, x3, x4 = self.encode(x)
-
-        # Decode using enriched features
-        logits_amodal_mask, logits_amodal_content = self.decode(x1, x2, x3, x4)
-
-        return logits_amodal_mask, logits_amodal_content
-        
     def forward(self, rgb_image, modal_mask):
         """
         Forward pass adapted for our training pipeline
@@ -112,7 +93,6 @@ class Unet_Image(nn.Module):
         
         Returns:
             logits_amodal_mask: Amodal mask logits (B, 1, H, W)
-            logits_amodal_content: Amodal content logits (B, 3, H, W)
         """
         # Add channel dimension to modal mask
         modal_mask = modal_mask.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
@@ -120,117 +100,11 @@ class Unet_Image(nn.Module):
         # Concatenate RGB image and modal mask
         model_input = torch.cat([rgb_image, modal_mask], dim=1)  # (B, 4, H, W)
         
-        # Get predictions
-        logits_amodal_mask, logits_amodal_content = self.encode_decode(model_input)
+        # Encode-decode
+        x1, x2, x3, x4 = self.encode(model_input)
+        logits_amodal_mask = self.decode(x1, x2, x3, x4)
 
-        # Should we mask the amodal content prediction by the predicted amodal mask?
-        if self.mask_content_preds:
-            # Element-wise masking by self-predictions:
-            logits_amodal_content = logits_amodal_mask.sigmoid().round() * logits_amodal_content
-
-        return logits_amodal_mask, logits_amodal_content
-    
-    def loss_function(self,
-                    amodal_mask_preds,
-                    amodal_mask_labels,
-                    amodal_content_preds,
-                    amodal_content_labels):
-        mask_loss = self.bce_loss(amodal_mask_preds, amodal_mask_labels)
-        content_loss = self.mse_loss(amodal_content_preds, amodal_content_labels)
-        return mask_loss, content_loss
-
-# Keep the original ResNet model as an alternative
-class ResNetAmodalModel(nn.Module):
-    def __init__(self, backbone='resnet18', pretrained=True):
-        """
-        Original ResNet-based amodal segmentation model
-        """
-        super(ResNetAmodalModel, self).__init__()
-        
-        # Load backbone
-        if backbone == 'resnet18':
-            self.backbone = models.resnet18(pretrained=pretrained)
-            self.backbone_channels = 512
-        elif backbone == 'resnet34':
-            self.backbone = models.resnet34(pretrained=pretrained)
-            self.backbone_channels = 512
-        elif backbone == 'resnet50':
-            self.backbone = models.resnet50(pretrained=pretrained)
-            self.backbone_channels = 2048
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone}")
-        
-        # Modify first conv layer to accept 4 channels (RGB + modal mask)
-        original_conv1 = self.backbone.conv1
-        self.backbone.conv1 = nn.Conv2d(
-            4,  # 3 RGB + 1 modal mask
-            original_conv1.out_channels,
-            kernel_size=original_conv1.kernel_size,
-            stride=original_conv1.stride,
-            padding=original_conv1.padding,
-            bias=False
-        )
-        
-        # Initialize new weights
-        with torch.no_grad():
-            # Copy RGB weights
-            self.backbone.conv1.weight[:, :3, :, :] = original_conv1.weight
-            # Initialize modal mask channel weights (average of RGB channels)
-            self.backbone.conv1.weight[:, 3:4, :, :] = original_conv1.weight.mean(dim=1, keepdim=True)
-        
-        # Remove classifier layers
-        self.backbone = nn.Sequential(*list(self.backbone.children())[:-2])
-        
-        # Decoder for upsampling
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(self.backbone_channels, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            
-            # Final layer - output single channel (amodal mask)
-            nn.Conv2d(16, 1, kernel_size=3, padding=1),
-        )
-    
-    def forward(self, rgb_image, modal_mask):
-        """
-        Forward pass
-        
-        Args:
-            rgb_image: RGB image tensor (B, 3, H, W)
-            modal_mask: Modal mask tensor (B, H, W)
-        
-        Returns:
-            logits: Amodal mask logits (B, 1, H, W)
-        """
-        # Add channel dimension to modal mask
-        modal_mask = modal_mask.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
-        
-        # Concatenate RGB image and modal mask
-        x = torch.cat([rgb_image, modal_mask], dim=1)  # (B, 4, H, W)
-        
-        # Backbone feature extraction
-        features = self.backbone(x)  # (B, backbone_channels, H/32, W/32)
-        
-        # Decode to original size
-        logits = self.decoder(features)  # (B, 1, H, W)
-        
-        return logits
+        return logits_amodal_mask
 
 class MetricsCalculator:
     @staticmethod
@@ -266,35 +140,22 @@ class MetricsCalculator:
         f1 = f1_score(true_binary, pred_binary, average='binary', zero_division=0)
         
         return jaccard, f1
-    
-    @staticmethod
-    def calculate_content_metrics(pred_content, true_content):
-        """Calculate content reconstruction metrics"""
-        mse = F.mse_loss(pred_content, true_content).item()
-        mae = F.l1_loss(pred_content, true_content).item()
-        
-        # PSNR calculation
-        if mse > 0:
-            psnr = 20 * torch.log10(1.0 / torch.sqrt(torch.tensor(mse))).item()
-        else:
-            psnr = float('inf')
-        
-        return {'mse': mse, 'mae': mae, 'psnr': psnr}
 
 class AmodalSegmentationTrainer:
     def __init__(self, model, train_loader, val_loader, device='cuda', use_logger=False, 
-                 project_name='amodal-segmentation', run_name=None):
+                 project_name='amodal-segmentation', run_name=None, learning_rate=1e-4):
         """
-        Trainer for amodal segmentation model
+        Trainer for U-Net amodal segmentation model
         
         Args:
-            model: AmodalSegmentationModel instance
+            model: Unet_Image instance
             train_loader: Training DataLoader
             val_loader: Validation DataLoader
             device: Device to run on ('cuda' or 'cpu')
             use_logger: Whether to use wandb logging
             project_name: WandB project name
             run_name: WandB run name
+            learning_rate: Learning rate for optimizer
         """
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -306,7 +167,7 @@ class AmodalSegmentationTrainer:
         self.criterion = nn.BCEWithLogitsLoss()
         
         # Optimizer
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
         
         # Metrics calculator
         self.metrics_calc = MetricsCalculator()
@@ -317,10 +178,11 @@ class AmodalSegmentationTrainer:
                 project=project_name,
                 name=run_name,
                 config={
-                    'model': model.__class__.__name__,
+                    'model': 'Unet_Image',
                     'optimizer': 'Adam',
-                    'learning_rate': 1e-4,
-                    'loss_function': 'BCEWithLogitsLoss'
+                    'learning_rate': learning_rate,
+                    'loss_function': 'BCEWithLogitsLoss',
+                    'device': device
                 }
             )
             wandb.watch(self.model)
@@ -342,9 +204,9 @@ class AmodalSegmentationTrainer:
             
             # Forward pass
             self.optimizer.zero_grad()
-            logits = self.model(images, modal_masks)
+            logits = self.model(images, modal_masks)  # (B, 1, H, W)
             
-            # Calculate loss
+            # Calculate loss - squeeze to match amodal_masks shape (B, H, W)
             loss = self.criterion(logits.squeeze(1), amodal_masks)
             
             # Backward pass
@@ -353,7 +215,7 @@ class AmodalSegmentationTrainer:
             
             # Calculate metrics
             with torch.no_grad():
-                pred_probs = torch.sigmoid(logits.squeeze(1))
+                pred_probs = torch.sigmoid(logits.squeeze(1))  # Convert to probabilities
                 
                 miou = self.metrics_calc.calculate_miou(pred_probs, amodal_masks)
                 accuracy = self.metrics_calc.calculate_accuracy(pred_probs, amodal_masks)
@@ -373,7 +235,8 @@ class AmodalSegmentationTrainer:
                     'batch_train_miou': miou,
                     'batch_train_accuracy': accuracy,
                     'batch_train_jaccard': jaccard,
-                    'batch_train_f1': f1
+                    'batch_train_f1': f1,
+                    'batch_idx': batch_idx
                 })
         
         # Return average metrics
@@ -430,7 +293,7 @@ class AmodalSegmentationTrainer:
             'val_f1': total_f1 / num_batches
         }
     
-    def train(self, num_epochs):
+    def train(self, num_epochs, validate_every_n_epochs=1):
         """Train the model for specified number of epochs"""
         best_val_miou = 0.0
         
@@ -441,35 +304,52 @@ class AmodalSegmentationTrainer:
             # Train
             train_metrics = self.train_epoch()
             
-            # Validate
-            val_metrics = self.validate_epoch()
-            
-            # Print metrics
+            # Print training metrics
             print(f"Train - Loss: {train_metrics['train_loss']:.4f}, "
                   f"mIoU: {train_metrics['train_miou']:.4f}, "
-                  f"Acc: {train_metrics['train_accuracy']:.4f}")
-            print(f"Val   - Loss: {val_metrics['val_loss']:.4f}, "
-                  f"mIoU: {val_metrics['val_miou']:.4f}, "
-                  f"Acc: {val_metrics['val_accuracy']:.4f}")
+                  f"Acc: {train_metrics['train_accuracy']:.4f}, "
+                  f"J&F: {train_metrics['train_jaccard']:.4f}/{train_metrics['train_f1']:.4f}")
             
-            # Log to wandb
-            if self.use_logger:
-                wandb.log({
-                    'epoch': epoch + 1,
-                    **train_metrics,
-                    **val_metrics
-                })
-            
-            # Save best model
-            if val_metrics['val_miou'] > best_val_miou:
-                best_val_miou = val_metrics['val_miou']
-                torch.save(self.model.state_dict(), 'best_amodal_model.pth')
-                print(f"New best model saved! mIoU: {best_val_miou:.4f}")
+            # Validate only every N epochs
+            if (epoch + 1) % validate_every_n_epochs == 0:
+                val_metrics = self.validate_epoch()
+                
+                print(f"Val   - Loss: {val_metrics['val_loss']:.4f}, "
+                      f"mIoU: {val_metrics['val_miou']:.4f}, "
+                      f"Acc: {val_metrics['val_accuracy']:.4f}, "
+                      f"J&F: {val_metrics['val_jaccard']:.4f}/{val_metrics['val_f1']:.4f}")
+                
+                # Log to wandb
+                if self.use_logger:
+                    wandb.log({
+                        'epoch': epoch + 1,
+                        **train_metrics,
+                        **val_metrics
+                    })
+                
+                # Save best model
+                if val_metrics['val_miou'] > best_val_miou:
+                    best_val_miou = val_metrics['val_miou']
+                    torch.save(self.model.state_dict(), 'best_unet_amodal_model.pth')
+                    print(f"✓ New best model saved! mIoU: {best_val_miou:.4f}")
+                    
+                    # Log best model to wandb
+                    if self.use_logger:
+                        wandb.log({'best_val_miou': best_val_miou})
+            else:
+                # Log only training metrics when not validating
+                if self.use_logger:
+                    wandb.log({
+                        'epoch': epoch + 1,
+                        **train_metrics
+                    })
+        
+        print(f"\nTraining completed! Best validation mIoU: {best_val_miou:.4f}")
         
         if self.use_logger:
             wandb.finish()
     
-    def visualize_predictions(self, num_samples=4):
+    def visualize_predictions(self, num_samples=4, save_path=None):
         """Visualize model predictions"""
         self.model.eval()
         
@@ -494,9 +374,8 @@ class AmodalSegmentationTrainer:
             fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4*num_samples))
             
             for i in range(min(num_samples, images.shape[0])):
-                # RGB Image
+                # RGB Image (denormalize ImageNet)
                 img = images[i].permute(1, 2, 0).numpy()
-                # Denormalize (approximate)
                 img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
                 img = np.clip(img, 0, 1)
                 axes[i, 0].imshow(img)
@@ -505,7 +384,7 @@ class AmodalSegmentationTrainer:
                 
                 # Modal Mask
                 axes[i, 1].imshow(modal_masks[i].numpy(), cmap='gray')
-                axes[i, 1].set_title('Modal Mask')
+                axes[i, 1].set_title('Modal Mask (Input)')
                 axes[i, 1].axis('off')
                 
                 # Ground Truth Amodal Mask
@@ -519,12 +398,23 @@ class AmodalSegmentationTrainer:
                 axes[i, 3].axis('off')
             
             plt.tight_layout()
-            plt.show()
+            
+            if save_path:
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                print(f"Visualization saved to {save_path}")
+            else:
+                plt.show()
+            
+            # Log to wandb if enabled
+            if self.use_logger:
+                wandb.log({"predictions": wandb.Image(fig)})
+            
+            plt.close(fig)
 
 # Example usage
 if __name__ == "__main__":
-    # Import the dataloader functions (assuming they're in the same file or imported)
-    from your_dataloader_module import create_split_dataloaders
+    # Assuming the dataloader module is available
+    # from your_dataloader_module import create_split_dataloaders
     
     # Create dataloaders
     dataloaders = create_split_dataloaders(
@@ -534,25 +424,39 @@ if __name__ == "__main__":
         val_ratio=0.1,
         test_ratio=0.2,
         verbose=False,  # Disable verbose for training
-        save_plots=False
+        save_plots=False,
+        random_seed=42
     )
     
-    # Create model
-    model = AmodalSegmentationModel(backbone='resnet18', pretrained=True)
+    # Create U-Net model
+    model = Unet_Image(in_channels=4, mask_content_preds=False)
     
-    # Create trainer
+    # Create trainer with wandb logging
     trainer = AmodalSegmentationTrainer(
         model=model,
         train_loader=dataloaders['train'],
         val_loader=dataloaders['val'],
         device='cuda' if torch.cuda.is_available() else 'cpu',
         use_logger=True,  # Enable wandb logging
-        project_name='amodal-segmentation',
-        run_name='resnet18-experiment-1'
+        project_name='amodal-segmentation-unet',
+        run_name='unet-experiment-2',
+        learning_rate=1e-4
     )
-    
-    # Train the model
-    trainer.train(num_epochs=20)
+
+    # Train the model with validation every 4 epochs
+    trainer.train(num_epochs=10, validate_every_n_epochs=4)
     
     # Visualize predictions
-    trainer.visualize_predictions(num_samples=4)
+    trainer.visualize_predictions(num_samples=4, save_path='predictions.png')
+    
+    # Test the trained model
+    print("\n" + "="*50)
+    print("Testing on test set...")
+    
+    test_loader = dataloaders['test']
+    model.eval()
+    test_metrics = trainer.validate_epoch()  # Can reuse validation function
+    print(f"Test Results - mIoU: {test_metrics['val_miou']:.4f}, "
+          f"Accuracy: {test_metrics['val_accuracy']:.4f}, "
+          f"Jaccard: {test_metrics['val_jaccard']:.4f}, "
+          f"F1: {test_metrics['val_f1']:.4f}")
