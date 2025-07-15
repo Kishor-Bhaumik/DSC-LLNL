@@ -1,13 +1,14 @@
+
+
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 from torchvision import transforms
 
-
 class ImageMaskDataset(Dataset):
-    def __init__(self, data_path_file, transform=None, verbose=False, save_plots=True, plot_save_dir='./plots'):
+    def __init__(self, data_path_file, transform=None, verbose=False, save_plots=False, plot_save_dir='./plots'):
         """
         Dataset for loading RGB images with modal and amodal masks.
         
@@ -205,29 +206,41 @@ def get_imagenet_transforms(image_size=224):
         )
     ])
 
-def create_dataloader(data_path_file, batch_size=16, shuffle=True, num_workers=4, 
-                     image_size=224, verbose=False, save_plots=True, plot_save_dir='./plots'):
+def create_split_dataloaders(data_path_file, batch_size=16, shuffle=True, num_workers=4, 
+                           image_size=224, verbose=False, save_plots=False, plot_save_dir='./plots',
+                           train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, random_seed=42):
     """
-    Create a DataLoader for the image-mask dataset
+    Create train/val/test DataLoaders for the image-mask dataset
     
     Args:
         data_path_file (str): Path to the text file containing data paths
-        batch_size (int): Batch size for the DataLoader
+        batch_size (int): Batch size for the DataLoaders
         shuffle (bool): Whether to shuffle the data
         num_workers (int): Number of worker processes for data loading
         image_size (int): Target image size for resizing
         verbose (bool): If True, plot images during iteration
         save_plots (bool): If True, save plots instead of displaying them
         plot_save_dir (str): Directory to save plots when save_plots=True
+        train_ratio (float): Proportion of data for training (default: 0.7)
+        val_ratio (float): Proportion of data for validation (default: 0.1)
+        test_ratio (float): Proportion of data for testing (default: 0.2)
+        random_seed (int): Random seed for reproducible splits
     
     Returns:
-        torch.utils.data.DataLoader: Configured DataLoader
+        dict: Dictionary containing 'train', 'val', 'test' DataLoaders
     """
+    # Validate ratios
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
+        f"Ratios must sum to 1.0, got {train_ratio + val_ratio + test_ratio}"
+    
+    # Set random seed for reproducible splits
+    torch.manual_seed(random_seed)
+    
     # Get ImageNet transforms
     transform = get_imagenet_transforms(image_size)
     
-    # Create dataset
-    dataset = ImageMaskDataset(
+    # Create full dataset
+    full_dataset = ImageMaskDataset(
         data_path_file=data_path_file,
         transform=transform,
         verbose=verbose,
@@ -235,38 +248,104 @@ def create_dataloader(data_path_file, batch_size=16, shuffle=True, num_workers=4
         plot_save_dir=plot_save_dir
     )
     
-    # Create dataloader
-    dataloader = DataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+    # Calculate split sizes
+    total_size = len(full_dataset)
+    train_size = int(train_ratio * total_size)
+    val_size = int(val_ratio * total_size)
+    test_size = total_size - train_size - val_size  # Remaining samples go to test
+    
+    print(f"Dataset split:")
+    print(f"  Total samples: {total_size}")
+    print(f"  Train: {train_size} ({train_size/total_size:.1%})")
+    print(f"  Val: {val_size} ({val_size/total_size:.1%})")
+    print(f"  Test: {test_size} ({test_size/total_size:.1%})")
+    
+    # Split the dataset
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size]
     )
     
-    return dataloader
-
+    # Create DataLoaders
+    dataloaders = {
+        'train': DataLoader(
+            dataset=train_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available()
+        ),
+        'val': DataLoader(
+            dataset=val_dataset,
+            batch_size=batch_size,
+            shuffle=False,  # Don't shuffle validation
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available()
+        ),
+        'test': DataLoader(
+            dataset=test_dataset,
+            batch_size=batch_size,
+            shuffle=False,  # Don't shuffle test
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available()
+        )
+    }
+    
+    return dataloaders
 
 # Example usage:
 if __name__ == "__main__":
-    # Create dataloader
-    dataloader = create_dataloader(
+    # Create split dataloaders with plot saving enabled
+    dataloaders = create_split_dataloaders(
         data_path_file='data_path.txt',
         batch_size=4,
         shuffle=True,
-        verbose=False  # Set to True to see plots
+        verbose=False,       # Enable visualization
+        save_plots=False,    # Save plots instead of displaying
+        plot_save_dir='./sample_plots',  # Directory to save plots
+        train_ratio=0.7,    # 70% for training
+        val_ratio=0.1,      # 10% for validation
+        test_ratio=0.2,     # 20% for testing
+        random_seed=42      # For reproducible splits
     )
     
-    # Iterate through a few batches
-    for batch_idx, (images, modal_masks, amodal_masks) in enumerate(dataloader):
-        print(f"Batch {batch_idx}:")
+    # Access individual dataloaders
+    train_loader = dataloaders['train']
+    val_loader = dataloaders['val']
+    test_loader = dataloaders['test']
+    
+    # Example: Iterate through train dataloader
+    print("\n=== Training Data ===")
+    for batch_idx, (images, modal_masks, amodal_masks) in enumerate(train_loader):
+        print(f"Train Batch {batch_idx}:")
         print(f"  Images shape: {images.shape}")
         print(f"  Modal masks shape: {modal_masks.shape}")
         print(f"  Amodal masks shape: {amodal_masks.shape}")
-        print(f"  Modal mask unique values: {torch.unique(modal_masks)}")
-        print(f"  Amodal mask unique values: {torch.unique(amodal_masks)}")
-        print("-" * 50)
         
         # Break after a few batches for demonstration
-        if batch_idx >= 2:
+        if batch_idx >= 1:
             break
+    
+    # Example: Iterate through validation dataloader
+    print("\n=== Validation Data ===")
+    for batch_idx, (images, modal_masks, amodal_masks) in enumerate(val_loader):
+        print(f"Val Batch {batch_idx}:")
+        print(f"  Images shape: {images.shape}")
+        print(f"  Modal masks shape: {modal_masks.shape}")
+        print(f"  Amodal masks shape: {amodal_masks.shape}")
+        
+        # Break after a few batches for demonstration
+        if batch_idx >= 1:
+            break
+    
+    # Example: Iterate through test dataloader
+    print("\n=== Test Data ===")
+    for batch_idx, (images, modal_masks, amodal_masks) in enumerate(test_loader):
+        print(f"Test Batch {batch_idx}:")
+        print(f"  Images shape: {images.shape}")
+        print(f"  Modal masks shape: {modal_masks.shape}")
+        print(f"  Amodal masks shape: {amodal_masks.shape}")
+        
+        # Break after a few batches for demonstration
+        if batch_idx >= 1:
+            break
+    
