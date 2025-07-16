@@ -80,12 +80,19 @@ class ImageMaskDataset(Dataset):
         # Load and process amodal mask
         amodal_mask_img = Image.open(data_info['amodal_path'])
         amodal_mask_np = np.array(amodal_mask_img) / 255.0  # Convert 0,255 to 0,1
+
+        if len(amodal_mask_np.shape) == 2:
+            amodal_mask_pil = Image.fromarray((amodal_mask_np * 255).astype(np.uint8))
+            amodal_mask_resized = amodal_mask_pil.resize((target_size[1], target_size[0]), Image.NEAREST)
+            amodal_mask = torch.from_numpy(np.array(amodal_mask_resized) / 255.0).float()
         
-        # Resize amodal mask to match image size
-        amodal_mask_pil = Image.fromarray((amodal_mask_np * 255).astype(np.uint8))
-        amodal_mask_resized = amodal_mask_pil.resize((target_size[1], target_size[0]), Image.NEAREST)
-        amodal_mask = torch.from_numpy(np.array(amodal_mask_resized) / 255.0).float()
-        
+        else:
+            amodal_mask_img = Image.open(data_info['amodal_path']).convert('RGB')
+            if self.transform:
+                amodal_mask = self.transform(amodal_mask_img)
+            else:
+                amodal_mask = transforms.ToTensor()(amodal_mask_img)
+
         # Apply transforms to RGB image
         if self.transform:
             rgb_image = self.transform(rgb_image)
@@ -296,7 +303,7 @@ def create_split_dataloaders(data_path_file, batch_size=16, shuffle=True, num_wo
 if __name__ == "__main__":
     # Create split dataloaders with plot saving enabled
     dataloaders = create_split_dataloaders(
-        data_path_file='data_path.txt',
+        data_path_file='data_path12.txt',
         batch_size=4,
         shuffle=True,
         verbose=False,       # Enable visualization
