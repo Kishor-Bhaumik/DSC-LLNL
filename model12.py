@@ -471,7 +471,7 @@ if __name__ == "__main__":
     )
     
     # Train the model
-    trainer.train(num_epochs=3, validate_every_n_epochs=2)
+    trainer.train(num_epochs=20, validate_every_n_epochs=2)
     
     # Visualize RGB content predictions
     trainer.visualize_predictions(num_samples=4, save_path='rgb_content_predictions.png')
