@@ -9,7 +9,6 @@ from dataloader import create_split_dataloaders  # Assuming this is your custom 
 import matplotlib.pyplot as plt
 from sklearn.metrics import jaccard_score, f1_score
 
-# U-Net Implementation from the provided code
 class conv2d_inplace_spatial(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
 
